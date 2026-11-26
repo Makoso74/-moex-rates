@@ -1,19 +1,30 @@
-name: Test MOEX
+name: Update MOEX
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: moex-update
+  cancel-in-progress: false
 
 jobs:
-  test:
+  update:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Check MOEX with certificate validation
+      - uses: actions/checkout@v4
+
+      - name: Fetch and validate MOEX
         shell: python
         run: |
-          import ssl, urllib.request, hashlib, json
+          import ssl, urllib.request, hashlib, json, math, os
+          from pathlib import Path
+          from datetime import datetime, timezone
 
           ca_url = "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt"
           with urllib.request.urlopen(ca_url, timeout=20) as r:
@@ -35,26 +46,85 @@ jobs:
               "?iss.meta=off&iss.only=marketdata,securities"
           )
           with urllib.request.urlopen(url, context=ctx, timeout=20) as r:
-              print("MOEX HTTP:", r.status)
               data = json.load(r)
 
           def field(block, key):
               b = data.get(block, {})
-              columns = b.get("columns", [])
-              rows = b.get("data", [])
-              return rows[0][columns.index(key)] if rows and key in columns else None
+              columns, rows = b.get("columns", []), b.get("data", [])
+              if rows and key in columns:
+                  return rows[0][columns.index(key)]
+              return None
+
+          if field("securities", "SECID") != "CNYRUB_TOM":
+              raise RuntimeError("Unexpected instrument")
 
           for block, key in [
               ("marketdata", "LAST"),
               ("marketdata", "WAPRICE"),
               ("securities", "PREVPRICE"),
           ]:
-              value = field(block, key)
-              if isinstance(value, (int, float)) and value > 0:
-                  print("CNY/RUB:", value, "priceType:", key)
+              rate = field(block, key)
+              if (
+                  isinstance(rate, (int, float))
+                  and not isinstance(rate, bool)
+                  and math.isfinite(rate)
+                  and rate > 0
+              ):
+                  price_type = key
                   break
           else:
               raise RuntimeError("Valid rate not found")
 
-          print("Source time:", field("marketdata", "SYSTIME"))
-          print("TLS validation: enabled")
+          source_stamp = field("marketdata", "SYSTIME")
+          if price_type == "PREVPRICE":
+              source_date = field("securities", "PREVDATE")
+              source_time = None
+          else:
+              if not source_stamp:
+                  raise RuntimeError("Source timestamp missing")
+              source_date = source_stamp[:10]
+              source_time = (
+                  field("marketdata", "TIME")
+                  if price_type == "LAST"
+                  else field("marketdata", "UPDATETIME")
+              )
+
+          datetime.strptime(source_date, "%Y-%m-%d")
+          if source_time:
+              datetime.strptime(source_time, "%H:%M:%S")
+
+          result = {
+              "schemaVersion": 1,
+              "source": "MOEX ISS",
+              "instrument": "CNYRUB_TOM",
+              "base": "CNY",
+              "quote": "RUB",
+              "rate": rate,
+              "priceType": price_type,
+              "sourceDate": source_date,
+              "sourceTime": source_time,
+              "sourceTimezone": "Europe/Moscow",
+              "sourceTimestamp": source_stamp,
+              "fetchedAt": datetime.now(timezone.utc).isoformat(),
+          }
+
+          Path("latest").mkdir(exist_ok=True)
+          temp = Path("latest/moex.json.tmp")
+          temp.write_text(
+              json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          os.replace(temp, "latest/moex.json")
+          print(json.dumps(result, ensure_ascii=False, indent=2))
+
+      - name: Publish JSON
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add latest/moex.json
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Update MOEX rate"
+            git push
+          fi
