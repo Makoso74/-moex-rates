@@ -1,0 +1,60 @@
+name: Test MOEX
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check MOEX with certificate validation
+        shell: python
+        run: |
+          import ssl, urllib.request, hashlib, json
+
+          ca_url = "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt"
+          with urllib.request.urlopen(ca_url, timeout=20) as r:
+              pem = r.read().decode()
+
+          fingerprint = hashlib.sha256(
+              ssl.PEM_cert_to_DER_cert(pem)
+          ).hexdigest()
+          expected = "d26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31"
+          if fingerprint != expected:
+              raise RuntimeError("Unexpected CA fingerprint")
+
+          ctx = ssl.create_default_context()
+          ctx.load_verify_locations(cadata=pem)
+
+          url = (
+              "https://iss.moex.com/iss/engines/currency/"
+              "markets/selt/boards/CETS/securities/CNYRUB_TOM.json"
+              "?iss.meta=off&iss.only=marketdata,securities"
+          )
+          with urllib.request.urlopen(url, context=ctx, timeout=20) as r:
+              print("MOEX HTTP:", r.status)
+              data = json.load(r)
+
+          def field(block, key):
+              b = data.get(block, {})
+              columns = b.get("columns", [])
+              rows = b.get("data", [])
+              return rows[0][columns.index(key)] if rows and key in columns else None
+
+          for block, key in [
+              ("marketdata", "LAST"),
+              ("marketdata", "WAPRICE"),
+              ("securities", "PREVPRICE"),
+          ]:
+              value = field(block, key)
+              if isinstance(value, (int, float)) and value > 0:
+                  print("CNY/RUB:", value, "priceType:", key)
+                  break
+          else:
+              raise RuntimeError("Valid rate not found")
+
+          print("Source time:", field("marketdata", "SYSTIME"))
+          print("TLS validation: enabled")
