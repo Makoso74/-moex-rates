@@ -3,128 +3,74 @@ name: Update MOEX
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7,22,37,52 * * * *"
+    - cron: '17 * * * *'
 
 permissions:
   contents: write
-
-concurrency:
-  group: moex-update
-  cancel-in-progress: false
+  actions: write
 
 jobs:
-  update:
+  guard:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Skip scheduled start if a loop is active
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          SELF_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "schedule" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          busy=$(gh run list \
+            --workflow test-moex.yml \
+            --limit 100 \
+            --json databaseId,status \
+            --jq "[.[] | select(.databaseId != $SELF_ID and (.status == \"in_progress\" or .status == \"queued\" or .status == \"pending\" or .status == \"waiting\" or .status == \"requested\"))] | length")
+
+          if [ "$busy" -gt 0 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  update:
+    needs: guard
+    if: needs.guard.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    concurrency:
+      group: moex-loop
+      cancel-in-progress: false
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch and validate MOEX
-        shell: python
-        run: |
-          import ssl, urllib.request, hashlib, json, math, os
-          from pathlib import Path
-          from datetime import datetime, timezone
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
-          ca_url = "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt"
-          with urllib.request.urlopen(ca_url, timeout=20) as r:
-              pem = r.read().decode()
-
-          fingerprint = hashlib.sha256(
-              ssl.PEM_cert_to_DER_cert(pem)
-          ).hexdigest()
-          expected = "d26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31"
-          if fingerprint != expected:
-              raise RuntimeError("Unexpected CA fingerprint")
-
-          ctx = ssl.create_default_context()
-          ctx.load_verify_locations(cadata=pem)
-
-          url = (
-              "https://iss.moex.com/iss/engines/currency/"
-              "markets/selt/boards/CETS/securities/CNYRUB_TOM.json"
-              "?iss.meta=off&iss.only=marketdata,securities"
-          )
-          with urllib.request.urlopen(url, context=ctx, timeout=20) as r:
-              data = json.load(r)
-
-          def field(block, key):
-              b = data.get(block, {})
-              columns, rows = b.get("columns", []), b.get("data", [])
-              if rows and key in columns:
-                  return rows[0][columns.index(key)]
-              return None
-
-          if field("securities", "SECID") != "CNYRUB_TOM":
-              raise RuntimeError("Unexpected instrument")
-
-          for block, key in [
-              ("marketdata", "LAST"),
-              ("marketdata", "WAPRICE"),
-              ("securities", "PREVPRICE"),
-          ]:
-              rate = field(block, key)
-              if (
-                  isinstance(rate, (int, float))
-                  and not isinstance(rate, bool)
-                  and math.isfinite(rate)
-                  and rate > 0
-              ):
-                  price_type = key
-                  break
-          else:
-              raise RuntimeError("Valid rate not found")
-
-          source_stamp = field("marketdata", "SYSTIME")
-          if price_type == "PREVPRICE":
-              source_date = field("securities", "PREVDATE")
-              source_time = None
-          else:
-              if not source_stamp:
-                  raise RuntimeError("Source timestamp missing")
-              source_date = source_stamp[:10]
-              source_time = (
-                  field("marketdata", "TIME")
-                  if price_type == "LAST"
-                  else field("marketdata", "UPDATETIME")
-              )
-
-          datetime.strptime(source_date, "%Y-%m-%d")
-          if source_time:
-              datetime.strptime(source_time, "%H:%M:%S")
-
-          result = {
-              "schemaVersion": 1,
-              "source": "MOEX ISS",
-              "instrument": "CNYRUB_TOM",
-              "base": "CNY",
-              "quote": "RUB",
-              "rate": rate,
-              "priceType": price_type,
-              "sourceDate": source_date,
-              "sourceTime": source_time,
-              "sourceTimezone": "Europe/Moscow",
-              "sourceTimestamp": source_stamp,
-              "fetchedAt": datetime.now(timezone.utc).isoformat(),
-          }
-
-          Path("latest").mkdir(exist_ok=True)
-          temp = Path("latest/moex.json.tmp")
-          temp.write_text(
-              json.dumps(result, ensure_ascii=False, indent=2) + "\n",
-              encoding="utf-8",
-          )
-          os.replace(temp, "latest/moex.json")
-          print(json.dumps(result, ensure_ascii=False, indent=2))
-
-      - name: Publish JSON
+      - name: Configure snapshot author
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add latest/moex.json
-          if git diff --cached --quiet; then
-            echo "No changes"
-          else
-            git commit -m "Update MOEX rate"
-            git push
-          fi
+
+      - name: Update every five minutes for 5.5 hours
+        timeout-minutes: 336
+        run: node scripts/moex.mjs
+
+      - name: Restart itself
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run test-moex.yml --ref main
