@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "source": "MOEX ISS",
+  "instrument": "CNYRUB_TOM",
+  "base": "CNY",
+  "quote": "RUB",
+  "rate": 12.3135,
+  "priceType": "LAST",
+  "sourceDate": "2026-11-27",
+  "sourceTime": "18:59:42",
+  "sourceTimezone": "Europe/Moscow",
+  "sourceTimestamp": "2026-11-27 23:50:01",
+  "fetchedAt": "2026-11-28T18:15:03.647Z"
+}
